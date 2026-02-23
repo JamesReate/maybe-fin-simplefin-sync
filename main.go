@@ -1,24 +1,27 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
 // --- Configuration Structs ---
 type Config struct {
-	MaybeAPIKey   string            `json:"maybe_api_key"`
-	MaybeBaseURL  string            `json:"maybe_base_url"` // e.g., http://localhost:3000/api/v1
-	AccessURL     string            `json:"access_url"`     // The permanent SimpleFIN URL
-	SetupToken    string            `json:"setup_token"`    // Used only once if AccessURL is empty
-	AccountMap    map[string]string `json:"account_map"`    // Maps SimpleFIN ID -> Maybe ID
+	MaybeAPIKey  string            `json:"maybe_api_key"`
+	MaybeBaseURL string            `json:"maybe_base_url"` // e.g., http://localhost:3000/api/v1
+	AccessURL    string            `json:"access_url"`     // The permanent SimpleFIN URL
+	SetupToken   string            `json:"setup_token"`    // Used only once if AccessURL is empty
+	AccountMap   map[string]string `json:"account_map"`    // Maps SimpleFIN ID -> Maybe ID
 }
 
 // --- SimpleFIN Structs ---
@@ -27,8 +30,16 @@ type SimpleFINResponse struct {
 }
 type SFAccount struct {
 	ID           string          `json:"id"`
+	Name         string          `json:"name"`
+	Org          SFOrg           `json:"org"`
 	Transactions []SFTransaction `json:"transactions"`
 }
+
+type SFOrg struct {
+	Domain  string `json:"domain"`
+	SfinURL string `json:"sfin-url"`
+}
+
 type SFTransaction struct {
 	ID           string `json:"id"`
 	Amount       string `json:"amount"`
@@ -45,11 +56,54 @@ type MaybeTransaction struct {
 	Notes     string `json:"notes"`
 }
 
+type MaybeAccount struct {
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Balance        string `json:"balance"`
+	Currency       string `json:"currency"`
+	Classification string `json:"classification"`
+	AccountType    string `json:"account_type"`
+}
+
+type MaybeAccountsResponse struct {
+	Accounts []MaybeAccount `json:"accounts"`
+}
+
+type CreateMaybeAccountRequest struct {
+	Account struct {
+		Name         string  `json:"name"`
+		Balance      float64 `json:"balance"`
+		CurrencyCode string  `json:"currency_code"`
+		Category     string  `json:"category"`
+	} `json:"account"`
+}
+
+type CreateMaybeAccountResponse struct {
+	Account MaybeAccount `json:"account"`
+}
+
 const stateFile = "sync_state.json"
 const configFile = "config.json"
 
 func main() {
+	autoCreate := flag.Bool("auto-create-accounts", false, "Automatically prompt to create unmapped accounts")
+	flag.Parse()
+
 	config := loadConfig()
+
+	// Print Maybe Finance Accounts
+	log.Println("Fetching accounts from Maybe Finance...")
+	maybeAccounts, err := fetchMaybeAccounts(config.MaybeBaseURL, config.MaybeAPIKey)
+	if err != nil {
+		log.Printf("Failed to fetch Maybe accounts: %v", err)
+	} else {
+		fmt.Println("\nMaybe Finance Accounts:")
+		for _, acc := range maybeAccounts {
+			fmt.Printf("- %s (ID: %s) Balance: %s\n", acc.Name, acc.ID, acc.Balance)
+		}
+		fmt.Println()
+	}
+
 	state := loadState()
 
 	// 1. Handle SimpleFIN Authentication
@@ -70,8 +124,21 @@ func main() {
 	for _, account := range sfData.Accounts {
 		maybeAccountID, mapped := config.AccountMap[account.ID]
 		if !mapped {
-			log.Printf("Skipping SimpleFIN account %s (Not mapped in config)", account.ID)
-			continue
+			if *autoCreate {
+				var err error
+				maybeAccountID, err = promptAndCreateMaybeAccount(config.MaybeBaseURL, config.MaybeAPIKey, account)
+				if err != nil {
+					log.Printf("Failed to create account for %s: %v", account.Name, err)
+					log.Fatalf("Please manually create the account in Maybe Finance and try again. ID: %s", account.ID)
+				}
+				// Save config with new mapping
+				config.AccountMap[account.ID] = maybeAccountID
+				saveConfig(config)
+				log.Printf("Successfully mapped SimpleFIN account %s to Maybe account %s", account.Name, maybeAccountID)
+			} else {
+				log.Printf("Skipping SimpleFIN account %s, %s (Not mapped in config): %s", account.ID, account.Name, account.Org.Domain)
+				continue
+			}
 		}
 
 		for _, tx := range account.Transactions {
@@ -140,16 +207,40 @@ func fetchSimpleFINData(accessURL string) SimpleFINResponse {
 	return sfResp
 }
 
+func fetchMaybeAccounts(baseURL, apiKey string) ([]MaybeAccount, error) {
+	url := fmt.Sprintf("%s/accounts", baseURL)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result MaybeAccountsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return result.Accounts, nil
+}
+
 func createMaybeTransaction(baseURL, apiKey string, tx MaybeTransaction) error {
 	url := fmt.Sprintf("%s/transactions", baseURL)
-	
+
 	// Wrap in a "transaction" key as standard in Rails APIs
 	payload := map[string]interface{}{"transaction": tx}
 	jsonValue, _ := json.Marshal(payload)
 
 	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonValue))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("X-Api-Key", apiKey)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -162,6 +253,86 @@ func createMaybeTransaction(baseURL, apiKey string, tx MaybeTransaction) error {
 		return fmt.Errorf("API error %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 	return nil
+}
+
+func promptAndCreateMaybeAccount(baseURL, apiKey string, sfAcc SFAccount) (string, error) {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Printf("\nUnmapped SimpleFIN account found:\n")
+	fmt.Printf("  Name: %s\n", sfAcc.Name)
+	fmt.Printf("  Org:  %s\n", sfAcc.Org.Domain)
+
+	defaultName := fmt.Sprintf("%s %s", sfAcc.Name, sfAcc.Org.Domain)
+	fmt.Printf("Enter Maybe account name [%s]: ", defaultName)
+	name, _ := reader.ReadString('\n')
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = defaultName
+	}
+
+	var category string
+	validCategories := map[string]bool{
+		"depository":  true,
+		"credit_card": true,
+		"loan":        true,
+		"investment":  true,
+	}
+
+	for {
+		fmt.Printf("Enter category (depository, credit_card, loan, investment): ")
+		category, _ = reader.ReadString('\n')
+		category = strings.TrimSpace(category)
+		if validCategories[category] {
+			break
+		}
+		fmt.Println("Invalid category. Please try again.")
+	}
+
+	// For the initial balance, we might want to get it from SimpleFIN,
+	// but SFAccount in our struct doesn't have a balance field.
+	// SimpleFIN /accounts endpoint usually returns balance in some format.
+	// However, the issue description doesn't specify where to get the balance.
+	// I'll assume 0.0 for now, or just leave it to be updated by transactions.
+	// Actually, Maybe API might require it.
+
+	return createMaybeAccount(baseURL, apiKey, name, category)
+}
+
+func createMaybeAccount(baseURL, apiKey, name, category string) (string, error) {
+	url := fmt.Sprintf("%s/accounts", baseURL)
+
+	var payload CreateMaybeAccountRequest
+	payload.Account.Name = name
+	payload.Account.Category = category
+	payload.Account.CurrencyCode = "USD" // Defaulting to USD
+	payload.Account.Balance = 0.0        // Defaulting to 0.0
+
+	jsonValue, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonValue))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	fmt.Printf("Create account API response: %s\n", string(bodyBytes))
+
+	var result CreateMaybeAccountResponse
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		return "", err
+	}
+
+	return result.Account.ID, nil
 }
 
 func loadConfig() Config {
