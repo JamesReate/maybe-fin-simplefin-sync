@@ -31,10 +31,13 @@ type SimpleFINResponse struct {
 	Accounts []SFAccount `json:"accounts"`
 }
 type SFAccount struct {
-	ID           string          `json:"id"`
-	Name         string          `json:"name"`
-	Org          SFOrg           `json:"org"`
-	Transactions []SFTransaction `json:"transactions"`
+	ID               string          `json:"id"`
+	Name             string          `json:"name"`
+	Org              SFOrg           `json:"org"`
+	Balance          float64         `json:"balance"`
+	AvailableBalance float64         `json:"available-balance"`
+	BalanceDate      uint64          `json:"balance-date"`
+	Transactions     []SFTransaction `json:"transactions"`
 }
 
 type SFOrg struct {
@@ -148,6 +151,7 @@ func main() {
 		}
 
 		for _, tx := range account.Transactions {
+			fmt.Printf("Processing %d transaction for %s: %s\n", len(account.Transactions), account.Name, tx.Description)
 			if _, processed := state[tx.ID]; processed {
 				continue // Idempotency check: skip if already processed
 			}
@@ -268,9 +272,11 @@ func fetchSimpleFINData(accessURL string, forceRefresh bool) SimpleFINResponse {
 
 		var sfResp SimpleFINResponse
 		json.NewDecoder(resp.Body).Decode(&sfResp)
+		fmt.Printf("Fetched %d accounts from SimpleFIN.\n", len(sfResp.Accounts))
 
 		// Update cache
 		for _, acc := range sfResp.Accounts {
+			fmt.Printf("Caching SimpleFIN account %s (ID: %s) with %d transactions and balance %.2f\n", acc.Name, acc.ID, len(acc.Transactions), acc.Balance)
 			cached := CachedAccount{
 				Account:   acc,
 				FetchedAt: time.Now(),
