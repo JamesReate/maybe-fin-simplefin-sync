@@ -13,6 +13,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/tidwall/gjson"
 )
 
 // --- Configuration Structs ---
@@ -76,15 +78,12 @@ type MaybeAccountsResponse struct {
 
 type CreateMaybeAccountRequest struct {
 	Account struct {
-		Name         string  `json:"name"`
-		Balance      float64 `json:"balance"`
-		CurrencyCode string  `json:"currency_code"`
-		Category     string  `json:"category"`
+		Name            string  `json:"name"`
+		Balance         float64 `json:"balance"`
+		Currency        string  `json:"currency"`
+		AccountableType string  `json:"accountable_type"`
+		SubType         string  `json:"sub_type"`
 	} `json:"account"`
-}
-
-type CreateMaybeAccountResponse struct {
-	Account MaybeAccount `json:"account"`
 }
 
 const stateFile = "sync_state.json"
@@ -349,42 +348,180 @@ func promptAndCreateMaybeAccount(baseURL, apiKey string, sfAcc SFAccount) (strin
 		name = defaultName
 	}
 
-	var category string
-	validCategories := map[string]bool{
-		"depository":  true,
-		"credit_card": true,
-		"loan":        true,
-		"investment":  true,
+	// AccountableType picker
+	accountableTypes := []struct {
+		value string
+		label string
+	}{
+		{"Depository", "Depository (Assets) - Bank accounts like checking/savings"},
+		{"Investment", "Investment (Assets) - Brokerage, 401k, IRA, etc."},
+		{"Crypto", "Crypto (Assets) - Cryptocurrency wallets/exchanges"},
+		{"Property", "Property (Assets) - Real estate"},
+		{"Vehicle", "Vehicle (Assets) - Cars, trucks, etc."},
+		{"OtherAsset", "Other Asset (Assets) - Jewelry, collectibles, etc."},
+		{"CreditCard", "Credit Card (Liabilities) - Credit card debt"},
+		{"Loan", "Loan (Liabilities) - Mortgages, student loans, etc."},
+		{"OtherLiability", "Other Liability (Liabilities) - Other debts"},
+	}
+
+	fmt.Println("\nSelect AccountableType:")
+	for i, at := range accountableTypes {
+		fmt.Printf("  %d. %s\n", i+1, at.label)
+	}
+
+	var accountableType string
+	for {
+		fmt.Print("Enter selection (1-9): ")
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+		if idx := parseInt(input); idx >= 1 && idx <= len(accountableTypes) {
+			accountableType = accountableTypes[idx-1].value
+			break
+		}
+		fmt.Println("Invalid selection. Please try again.")
+	}
+
+	// SubType picker based on AccountableType
+	subtype := promptSubtype(reader, accountableType)
+
+	return createMaybeAccount(baseURL, apiKey, name, accountableType, subtype)
+}
+
+func promptSubtype(reader *bufio.Reader, accountableType string) string {
+	subtypes := getSubtypes(accountableType)
+	if len(subtypes) == 0 {
+		return "" // No subtypes for this accountableType
+	}
+
+	fmt.Printf("\nSelect SubType for %s:\n", accountableType)
+	for i, st := range subtypes {
+		fmt.Printf("  %d. %s\n", i+1, st.label)
 	}
 
 	for {
-		fmt.Printf("Enter category (depository, credit_card, loan, investment): ")
-		category, _ = reader.ReadString('\n')
-		category = strings.TrimSpace(category)
-		if validCategories[category] {
-			break
+		fmt.Printf("Enter selection (1-%d): ", len(subtypes))
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+		if idx := parseInt(input); idx >= 1 && idx <= len(subtypes) {
+			return subtypes[idx-1].value
 		}
-		fmt.Println("Invalid category. Please try again.")
+		fmt.Println("Invalid selection. Please try again.")
 	}
-
-	// For the initial balance, we might want to get it from SimpleFIN,
-	// but SFAccount in our struct doesn't have a balance field.
-	// SimpleFIN /accounts endpoint usually returns balance in some format.
-	// However, the issue description doesn't specify where to get the balance.
-	// I'll assume 0.0 for now, or just leave it to be updated by transactions.
-	// Actually, Maybe API might require it.
-
-	return createMaybeAccount(baseURL, apiKey, name, category)
 }
 
-func createMaybeAccount(baseURL, apiKey, name, category string) (string, error) {
+func getSubtypes(accountableType string) []struct {
+	value string
+	label string
+} {
+	switch accountableType {
+	case "Depository":
+		return []struct {
+			value string
+			label string
+		}{
+			{"checking", "Checking Account"},
+			{"savings", "Savings Account"},
+			{"hsa", "Health Savings Account"},
+			{"cd", "Certificate of Deposit"},
+			{"money_market", "Money Market Account"},
+		}
+	case "Investment":
+		return []struct {
+			value string
+			label string
+		}{
+			{"brokerage", "Brokerage (USA)"},
+			{"401k", "401(k) (USA)"},
+			{"roth_401k", "Roth 401(k) (USA)"},
+			{"403b", "403(b) (USA)"},
+			{"457b", "457(b) (USA)"},
+			{"tsp", "Thrift Savings Plan (USA)"},
+			{"ira", "IRA (USA)"},
+			{"roth_ira", "Roth IRA (USA)"},
+			{"sep_ira", "SEP IRA (USA)"},
+			{"simple_ira", "SIMPLE IRA (USA)"},
+			{"529_plan", "529 Plan (USA)"},
+			{"hsa", "HSA (USA)"},
+			{"ugma", "UGMA (USA)"},
+			{"utma", "UTMA (USA)"},
+			{"isa", "ISA (UK)"},
+			{"lisa", "LISA (UK)"},
+			{"sipp", "SIPP (UK)"},
+			{"workplace_pension_uk", "Workplace Pension (UK)"},
+			{"rrsp", "RRSP (Canada)"},
+			{"tfsa", "TFSA (Canada)"},
+			{"resp", "RESP (Canada)"},
+			{"lira", "LIRA (Canada)"},
+			{"rrif", "RRIF (Canada)"},
+			{"super", "Superannuation (Australia)"},
+			{"smsf", "SMSF (Australia)"},
+			{"pea", "PEA (Europe)"},
+			{"pillar_3a", "Pillar 3a (Europe)"},
+			{"riester", "Riester (Europe)"},
+			{"pension", "Pension (Global)"},
+			{"retirement", "Retirement (Global)"},
+			{"mutual_fund", "Mutual Fund (Global)"},
+			{"angel", "Angel Investment (Global)"},
+			{"trust", "Trust (Global)"},
+			{"other", "Other (Global)"},
+		}
+	case "Crypto":
+		return []struct {
+			value string
+			label string
+		}{
+			{"wallet", "Crypto Wallet"},
+			{"exchange", "Crypto Exchange"},
+		}
+	case "Property":
+		return []struct {
+			value string
+			label string
+		}{
+			{"single_family_home", "Single Family Home"},
+			{"multi_family_home", "Multi Family Home"},
+			{"condominium", "Condominium"},
+			{"townhouse", "Townhouse"},
+			{"investment_property", "Investment Property"},
+			{"second_home", "Second Home"},
+		}
+	case "CreditCard":
+		return []struct {
+			value string
+			label string
+		}{
+			{"credit_card", "Credit Card"},
+		}
+	case "Loan":
+		return []struct {
+			value string
+			label string
+		}{
+			{"mortgage", "Mortgage"},
+			{"student", "Student Loan"},
+			{"auto", "Auto Loan"},
+			{"other", "Other Loan"},
+		}
+	default:
+		return nil
+	}
+}
+
+func parseInt(s string) int {
+	var n int
+	fmt.Sscanf(s, "%d", &n)
+	return n
+}
+
+func createMaybeAccount(baseURL, apiKey, name, category, subtype string) (string, error) {
 	url := fmt.Sprintf("%s/accounts", baseURL)
 
 	var payload CreateMaybeAccountRequest
 	payload.Account.Name = name
-	payload.Account.Category = category
-	payload.Account.CurrencyCode = "USD" // Defaulting to USD
-	payload.Account.Balance = 0.0        // Defaulting to 0.0
+	payload.Account.AccountableType = category
+	payload.Account.Currency = "USD" // Defaulting to USD
+	payload.Account.SubType = subtype
+	payload.Account.Balance = 0.0 // Defaulting to 0.0
 
 	jsonValue, _ := json.Marshal(payload)
 
@@ -406,12 +543,7 @@ func createMaybeAccount(baseURL, apiKey, name, category string) (string, error) 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	fmt.Printf("Create account API response: %s\n", string(bodyBytes))
 
-	var result CreateMaybeAccountResponse
-	if err := json.Unmarshal(bodyBytes, &result); err != nil {
-		return "", err
-	}
-
-	return result.Account.ID, nil
+	return gjson.GetBytes(bodyBytes, "id").String(), nil
 }
 
 func loadConfig() Config {
