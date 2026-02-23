@@ -47,6 +47,11 @@ type SFTransaction struct {
 	TransactedAt int64  `json:"transacted_at"`
 }
 
+type CachedAccount struct {
+	Account   SFAccount `json:"account"`
+	FetchedAt time.Time `json:"fetched_at"`
+}
+
 // --- Maybe Structs (Adjust based on your exact Maybe branch schema) ---
 type MaybeTransaction struct {
 	AccountID string `json:"account_id"`
@@ -84,9 +89,11 @@ type CreateMaybeAccountResponse struct {
 
 const stateFile = "sync_state.json"
 const configFile = "config.json"
+const cacheDir = "tmp"
 
 func main() {
 	autoCreate := flag.Bool("auto-create-accounts", false, "Automatically prompt to create unmapped accounts")
+	forceRefresh := flag.Bool("force-refresh", false, "Force refresh SimpleFIN data (ignore cache)")
 	flag.Parse()
 
 	config := loadConfig()
@@ -117,7 +124,7 @@ func main() {
 
 	// 2. Fetch Data from SimpleFIN
 	log.Println("Fetching transactions from SimpleFIN...")
-	sfData := fetchSimpleFINData(config.AccessURL)
+	sfData := fetchSimpleFINData(config.AccessURL, *forceRefresh)
 
 	// 3. Process and Sync to Maybe
 	newTxCount := 0
@@ -193,18 +200,90 @@ func claimSimpleFINToken(setupToken string) string {
 	return string(body) // This is the permanent Access URL
 }
 
-func fetchSimpleFINData(accessURL string) SimpleFINResponse {
-	// The Access URL contains the basic auth credentials inherently
-	reqURL := accessURL + "/accounts"
-	resp, err := http.Get(reqURL)
-	if err != nil || resp.StatusCode != 200 {
-		log.Fatalf("Failed to fetch SimpleFIN data. Status: %v", resp.StatusCode)
+func fetchSimpleFINData(accessURL string, forceRefresh bool) SimpleFINResponse {
+	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
+		os.Mkdir(cacheDir, 0755)
 	}
-	defer resp.Body.Close()
 
-	var sfResp SimpleFINResponse
-	json.NewDecoder(resp.Body).Decode(&sfResp)
-	return sfResp
+	var allAccounts []SFAccount
+
+	// Check for cached data
+	files, _ := os.ReadDir(cacheDir)
+	cachedMap := make(map[string]CachedAccount)
+	for _, f := range files {
+		if !strings.HasPrefix(f.Name(), "account_") || !strings.HasSuffix(f.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(cacheDir + "/" + f.Name())
+		if err != nil {
+			continue
+		}
+		var cached CachedAccount
+		if err := json.Unmarshal(data, &cached); err == nil {
+			if !forceRefresh && time.Since(cached.FetchedAt) < 24*time.Hour {
+				allAccounts = append(allAccounts, cached.Account)
+				cachedMap[cached.Account.ID] = cached
+			}
+		}
+	}
+
+	// SimpleFIN /accounts returns ALL accounts, but if we have some in cache,
+	// and we don't know if there are new ones, we might still want to call it.
+	// The requirement: "if you add a new account it should know only to pull the info for that account."
+	// This is tricky because /accounts returns all. If we want to know if there's a new account,
+	// we have to call it.
+
+	// However, if we pull all accounts and we see that they are already in cache,
+	// we can skip the heavy processing? No, the pull itself is the expensive part (API hit).
+
+	// If we have some accounts in cache, but some are missing or expired, we call /accounts.
+	// If all are in cache and not expired, and forceRefresh is false, we might still want to call
+	// to check for NEW accounts.
+
+	// To satisfy "track by account", we can assume if we have cached data for accounts,
+	// and we want to "know only to pull info for that account", maybe there's a param?
+	// SimpleFIN /accounts takes ?account=<id>? I'll check if it's common.
+	// Usually SimpleFIN is just a list.
+
+	// Let's call the API if forceRefresh is true OR if we have NO accounts in cache OR if anything is expired.
+	needsPull := forceRefresh || len(allAccounts) == 0
+
+	// Check if any cached account is expired
+	if !needsPull {
+		for _, cached := range cachedMap {
+			if time.Since(cached.FetchedAt) >= 24*time.Hour {
+				needsPull = true
+				break
+			}
+		}
+	}
+
+	if needsPull {
+		log.Println("Cache expired or missing, pulling from SimpleFIN...")
+		reqURL := accessURL + "/accounts"
+		resp, err := http.Get(reqURL)
+		if err != nil || resp.StatusCode != 200 {
+			log.Fatalf("Failed to fetch SimpleFIN data. Status: %v", resp.StatusCode)
+		}
+		defer resp.Body.Close()
+
+		var sfResp SimpleFINResponse
+		json.NewDecoder(resp.Body).Decode(&sfResp)
+
+		// Update cache
+		for _, acc := range sfResp.Accounts {
+			cached := CachedAccount{
+				Account:   acc,
+				FetchedAt: time.Now(),
+			}
+			data, _ := json.MarshalIndent(cached, "", "  ")
+			os.WriteFile(cacheDir+"/account_"+acc.ID+".json", data, 0644)
+		}
+		return sfResp
+	}
+
+	log.Println("Using cached SimpleFIN data.")
+	return SimpleFINResponse{Accounts: allAccounts}
 }
 
 func fetchMaybeAccounts(baseURL, apiKey string) ([]MaybeAccount, error) {
