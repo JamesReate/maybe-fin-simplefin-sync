@@ -11,10 +11,16 @@ import (
 	"time"
 )
 
-const cacheDir = "tmp"
+const (
+	cacheDir = "tmp"
+	// ANSI color codes
+	colorRed   = "\033[31m"
+	colorReset = "\033[0m"
+)
 
 // SimpleFINResponse represents the response from SimpleFIN API
 type SimpleFINResponse struct {
+	Errors   []string    `json:"errors,omitempty"`
 	Accounts []SFAccount `json:"accounts"`
 }
 
@@ -23,8 +29,8 @@ type SFAccount struct {
 	ID               string          `json:"id"`
 	Name             string          `json:"name"`
 	Org              SFOrg           `json:"org"`
-	Balance          float64         `json:"balance"`
-	AvailableBalance float64         `json:"available-balance"`
+	Balance          string          `json:"balance"`
+	AvailableBalance string          `json:"available-balance"`
 	BalanceDate      uint64          `json:"balance-date"`
 	Transactions     []SFTransaction `json:"transactions"`
 }
@@ -86,10 +92,14 @@ func FetchSimpleFINData(accessURL string, forceRefresh bool) SimpleFINResponse {
 	}
 	defer resp.Body.Close()
 
+	bodyBytes, _ := io.ReadAll(resp.Body)
 	var sfResp SimpleFINResponse
-	if err := json.NewDecoder(resp.Body).Decode(&sfResp); err != nil {
-		log.Fatalf("Failed to decode SimpleFIN response: %v", err)
+	if err := json.Unmarshal(bodyBytes, &sfResp); err != nil {
+		log.Fatalf("Failed to decode SimpleFIN response: %v\nResponse body: %s", err, string(bodyBytes))
 	}
+
+	// Print any errors from SimpleFIN
+	printSimpleFINErrors(sfResp.Errors)
 
 	log.Printf("Found %d accounts\n", len(sfResp.Accounts))
 
@@ -118,13 +128,17 @@ func FetchSimpleFINData(accessURL string, forceRefresh bool) SimpleFINResponse {
 			continue
 		}
 
+		txBodyBytes, _ := io.ReadAll(txResp.Body)
+		txResp.Body.Close()
+
 		var accountResp SimpleFINResponse
-		if err := json.NewDecoder(txResp.Body).Decode(&accountResp); err != nil {
-			log.Printf("Warning: Failed to decode transactions for account %s: %v", account.ID, err)
-			txResp.Body.Close()
+		if err := json.Unmarshal(txBodyBytes, &accountResp); err != nil {
+			log.Printf("Warning: Failed to decode transactions for account %s: %v\nResponse body: %s", account.ID, err, string(txBodyBytes))
 			continue
 		}
-		txResp.Body.Close()
+
+		// Print any errors from SimpleFIN for this account
+		printSimpleFINErrors(accountResp.Errors)
 
 		// Extract transactions from the response
 		if len(accountResp.Accounts) > 0 {
@@ -169,4 +183,13 @@ func getTransactionDateRange(accountID string, syncState map[string]AccountSyncS
 	// No previous sync - go back one year
 	startDate := time.Now().AddDate(-1, 0, 0).Format("2006-01-02")
 	return startDate, endDate
+}
+
+// printSimpleFINErrors prints SimpleFIN errors in red color
+func printSimpleFINErrors(errors []string) {
+	if len(errors) > 0 {
+		for _, errMsg := range errors {
+			fmt.Printf("%s⚠️  SimpleFIN Error: %s%s\n", colorRed, errMsg, colorReset)
+		}
+	}
 }
