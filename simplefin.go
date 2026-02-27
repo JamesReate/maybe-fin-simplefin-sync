@@ -13,6 +13,8 @@ import (
 
 const (
 	cacheDir = "tmp"
+	// 90 days in seconds
+	maxRangeSeconds = 90 * 24 * 60 * 60
 	// ANSI color codes
 	colorRed   = "\033[31m"
 	colorReset = "\033[0m"
@@ -75,7 +77,7 @@ func ClaimSimpleFINToken(setupToken string) string {
 }
 
 // FetchSimpleFINData fetches accounts and transactions from SimpleFIN
-func FetchSimpleFINData(accessURL string, forceRefresh bool) SimpleFINResponse {
+func FetchSimpleFINData(accessURL string, forceRefresh bool, config Config) SimpleFINResponse {
 	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
 		os.Mkdir(cacheDir, 0755)
 	}
@@ -103,55 +105,86 @@ func FetchSimpleFINData(accessURL string, forceRefresh bool) SimpleFINResponse {
 
 	log.Printf("Found %d accounts\n", len(sfResp.Accounts))
 
-	// Step 2: Fetch transactions for each account individually
+	// Step 2: Fetch transactions for each account individually in 90-day increments
 	totalTransactions := 0
 	for i := range sfResp.Accounts {
 		account := &sfResp.Accounts[i]
 
+		// Check if we should skip transactions for this account
+		if accConfig, mapped := config.AccountMap[account.ID]; mapped && accConfig.BalanceOnly {
+			log.Printf("Skipping transaction fetch for account %s (balance_only is set)", account.Name)
+			continue
+		}
+
 		// Determine date range for transaction fetch
-		startDate, endDate := getTransactionDateRange(account.ID, accountSyncState)
+		totalStartDate, totalEndDate := getTransactionDateRange(account.ID, accountSyncState)
 
-		log.Printf("Fetching transactions for account %s (%s)...", account.Name, account.ID)
+		log.Printf("Fetching transactions for account %s (%s) from %d to %d...", account.Name, account.ID, totalStartDate, totalEndDate)
 
-		// Build URL with account ID and date parameters
-		txURL := fmt.Sprintf("%s/accounts?account=%s", accessURL, account.ID)
-		if startDate != "" {
-			txURL += fmt.Sprintf("&start-date=%s", startDate)
+		// SimpleFIN API limit: Difference between start and end date must not exceed 90 days.
+		// Page through the total date range in increments of maxRangeSeconds (90 days).
+		currentStartDate := totalStartDate
+		for currentStartDate < totalEndDate {
+			currentEndDate := currentStartDate + maxRangeSeconds
+			if currentEndDate > totalEndDate {
+				currentEndDate = totalEndDate
+			}
+
+			log.Printf("  → Fetching page: %d to %d", currentStartDate, currentEndDate)
+
+			// Build URL with account ID and date parameters
+			txURL := fmt.Sprintf("%s/accounts?account=%s", accessURL, account.ID)
+			if currentStartDate != 0 {
+				txURL += fmt.Sprintf("&start-date=%d", currentStartDate)
+			}
+			if currentEndDate != 0 {
+				txURL += fmt.Sprintf("&end-date=%d", currentEndDate)
+			}
+
+			txResp, err := http.Get(txURL)
+			if err != nil || txResp.StatusCode != 200 {
+				if txResp != nil {
+					txBodyBytes, _ := io.ReadAll(txResp.Body)
+					txResp.Body.Close()
+					log.Printf("Warning: Failed to fetch transactions for account %s. Status: %v Body: %s Error: %v", account.ID, txResp.StatusCode, string(txBodyBytes), err)
+				} else {
+					log.Printf("Warning: Failed to fetch transactions for account %s: %v", account.ID, err)
+				}
+				log.Fatalf("failed to get trxs\n")
+			}
+
+			txBodyBytes, _ := io.ReadAll(txResp.Body)
+			txResp.Body.Close()
+
+			var accountResp SimpleFINResponse
+			if err := json.Unmarshal(txBodyBytes, &accountResp); err != nil {
+				log.Printf("Warning: Failed to decode transactions for account %s: %v\nResponse body: %s", account.ID, err, string(txBodyBytes))
+				break // Break the paging loop for this account on decode error
+			}
+
+			// Print any errors from SimpleFIN for this account
+			printSimpleFINErrors(accountResp.Errors)
+
+			// Extract transactions from the response and append to the account's transaction list
+			if len(accountResp.Accounts) > 0 {
+				account.Transactions = append(account.Transactions, accountResp.Accounts[0].Transactions...)
+				log.Printf("    → Pulled %d transactions in this page", len(accountResp.Accounts[0].Transactions))
+			}
+
+			// Move to the next page, starting exactly where we left off to avoid missing any transactions
+			currentStartDate = currentEndDate
 		}
-		if endDate != "" {
-			txURL += fmt.Sprintf("&end-date=%s", endDate)
-		}
 
-		txResp, err := http.Get(txURL)
-		if err != nil || txResp.StatusCode != 200 {
-			log.Printf("Warning: Failed to fetch transactions for account %s: %v", account.ID, err)
-			continue
-		}
-
-		txBodyBytes, _ := io.ReadAll(txResp.Body)
-		txResp.Body.Close()
-
-		var accountResp SimpleFINResponse
-		if err := json.Unmarshal(txBodyBytes, &accountResp); err != nil {
-			log.Printf("Warning: Failed to decode transactions for account %s: %v\nResponse body: %s", account.ID, err, string(txBodyBytes))
-			continue
-		}
-
-		// Print any errors from SimpleFIN for this account
-		printSimpleFINErrors(accountResp.Errors)
-
-		// Extract transactions from the response
-		if len(accountResp.Accounts) > 0 {
-			account.Transactions = accountResp.Accounts[0].Transactions
+		if len(account.Transactions) > 0 {
 			totalTransactions += len(account.Transactions)
-			log.Printf("  → Pulled %d transactions", len(account.Transactions))
+			log.Printf("  → Total pulled for %s: %d transactions", account.Name, len(account.Transactions))
 		} else {
-			log.Printf("  → No transactions found")
+			log.Printf("  → No transactions found for %s", account.Name)
 		}
 
-		// Update sync state for this account
+		// Update sync state for this account to the end of the total range we just processed
 		accountSyncState[account.ID] = AccountSyncState{
-			LastSyncDate: time.Now().Format("2006-01-02"),
+			LastSyncDate: totalEndDate,
 		}
 
 		// Cache the account data
@@ -171,17 +204,17 @@ func FetchSimpleFINData(accessURL string, forceRefresh bool) SimpleFINResponse {
 }
 
 // getTransactionDateRange determines the start and end dates for fetching transactions
-func getTransactionDateRange(accountID string, syncState map[string]AccountSyncState) (string, string) {
-	endDate := time.Now().Format("2006-01-02")
+func getTransactionDateRange(accountID string, syncState map[string]AccountSyncState) (int64, int64) {
+	endDate := time.Now().Unix()
 
 	// Check if we have a last sync date for this account
-	if state, exists := syncState[accountID]; exists && state.LastSyncDate != "" {
+	if state, exists := syncState[accountID]; exists && state.LastSyncDate != 0 {
 		// Use last sync date as start date to get only new transactions
 		return state.LastSyncDate, endDate
 	}
 
 	// No previous sync - go back one year
-	startDate := time.Now().AddDate(-1, 0, 0).Format("2006-01-02")
+	startDate := time.Now().AddDate(-1, 0, 0).Unix()
 	return startDate, endDate
 }
 

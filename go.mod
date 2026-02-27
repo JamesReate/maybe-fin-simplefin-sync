@@ -1,4 +1,4 @@
-module github.com/JamesReate/maybe-fin-simplefin-sync
+module github.com/JamesReate/sure-simplefin-sync
 
 go 1.25.0
 

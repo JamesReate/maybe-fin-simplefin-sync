@@ -12,7 +12,7 @@ const (
 
 // AccountSyncState tracks the last sync date for an account
 type AccountSyncState struct {
-	LastSyncDate string `json:"last_sync_date"` // YYYY-MM-DD format
+	LastSyncDate int64 `json:"last_sync_date"` // Unix timestamp
 }
 
 // LoadState loads the transaction sync state from disk

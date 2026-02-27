@@ -14,8 +14,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// MaybeTransaction represents a transaction in Maybe Finance
-type MaybeTransaction struct {
+// SureTransaction represents a transaction in Sure
+type SureTransaction struct {
 	AccountID string `json:"account_id"`
 	Amount    string `json:"amount"`
 	Date      string `json:"date"`
@@ -23,8 +23,8 @@ type MaybeTransaction struct {
 	Notes     string `json:"notes"`
 }
 
-// MaybeAccount represents an account in Maybe Finance
-type MaybeAccount struct {
+// SureAccount represents an account in Sure
+type SureAccount struct {
 	ID             string `json:"id"`
 	Name           string `json:"name"`
 	Balance        string `json:"balance"`
@@ -33,13 +33,13 @@ type MaybeAccount struct {
 	AccountType    string `json:"account_type"`
 }
 
-// MaybeAccountsResponse represents the response from Maybe accounts endpoint
-type MaybeAccountsResponse struct {
-	Accounts []MaybeAccount `json:"accounts"`
+// SureAccountsResponse represents the response from Sure accounts endpoint
+type SureAccountsResponse struct {
+	Accounts []SureAccount `json:"accounts"`
 }
 
-// CreateMaybeAccountRequest represents the request to create a Maybe account
-type CreateMaybeAccountRequest struct {
+// CreateSureAccountRequest represents the request to create a Sure account
+type CreateSureAccountRequest struct {
 	Account struct {
 		Name            string  `json:"name"`
 		Balance         float64 `json:"balance"`
@@ -49,8 +49,8 @@ type CreateMaybeAccountRequest struct {
 	} `json:"account"`
 }
 
-// FetchMaybeAccounts retrieves all accounts from Maybe Finance
-func FetchMaybeAccounts(baseURL, apiKey string) ([]MaybeAccount, error) {
+// FetchSureAccounts retrieves all accounts from Sure
+func FetchSureAccounts(baseURL, apiKey string) ([]SureAccount, error) {
 	url := fmt.Sprintf("%s/accounts", baseURL)
 
 	req, _ := http.NewRequest("GET", url, nil)
@@ -67,15 +67,15 @@ func FetchMaybeAccounts(baseURL, apiKey string) ([]MaybeAccount, error) {
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	var result MaybeAccountsResponse
+	var result SureAccountsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
 	return result.Accounts, nil
 }
 
-// CreateMaybeTransaction creates a new transaction in Maybe Finance
-func CreateMaybeTransaction(baseURL, apiKey string, tx MaybeTransaction) error {
+// CreateSureTransaction creates a new transaction in Sure
+func CreateSureTransaction(baseURL, apiKey string, tx SureTransaction) error {
 	url := fmt.Sprintf("%s/transactions", baseURL)
 
 	// Wrap in a "transaction" key as standard in Rails APIs
@@ -99,8 +99,8 @@ func CreateMaybeTransaction(baseURL, apiKey string, tx MaybeTransaction) error {
 	return nil
 }
 
-// PromptAndCreateMaybeAccount prompts the user to create a new Maybe account
-func PromptAndCreateMaybeAccount(baseURL, apiKey string, sfAcc SFAccount) (string, error) {
+// PromptAndCreateSureAccount prompts the user to create a new Sure account
+func PromptAndCreateSureAccount(baseURL, apiKey string, sfAcc SFAccount) (string, error) {
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Printf("\nUnmapped SimpleFIN account found:\n")
@@ -108,7 +108,7 @@ func PromptAndCreateMaybeAccount(baseURL, apiKey string, sfAcc SFAccount) (strin
 	fmt.Printf("  Org:  %s\n", sfAcc.Org.Domain)
 
 	defaultName := fmt.Sprintf("%s %s", sfAcc.Name, sfAcc.Org.Domain)
-	fmt.Printf("Enter Maybe account name [%s]: ", defaultName)
+	fmt.Printf("Enter Sure account name [%s]: ", defaultName)
 	name, _ := reader.ReadString('\n')
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -151,7 +151,7 @@ func PromptAndCreateMaybeAccount(baseURL, apiKey string, sfAcc SFAccount) (strin
 	// SubType picker based on AccountableType
 	subtype := promptSubtype(reader, accountableType)
 
-	return createMaybeAccount(baseURL, apiKey, name, accountableType, subtype)
+	return createSureAccount(baseURL, apiKey, name, accountableType, subtype)
 }
 
 // promptSubtype prompts the user to select a subtype based on the accountable type
@@ -276,11 +276,11 @@ func getSubtypes(accountableType string) []struct {
 	}
 }
 
-// createMaybeAccount creates a new account in Maybe Finance
-func createMaybeAccount(baseURL, apiKey, name, category, subtype string) (string, error) {
+// createSureAccount creates a new account in Sure
+func createSureAccount(baseURL, apiKey, name, category, subtype string) (string, error) {
 	url := fmt.Sprintf("%s/accounts", baseURL)
 
-	var payload CreateMaybeAccountRequest
+	var payload CreateSureAccountRequest
 	payload.Account.Name = name
 	payload.Account.AccountableType = category
 	payload.Account.Currency = "USD" // Defaulting to USD
